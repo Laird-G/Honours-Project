@@ -216,3 +216,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================================
+# CUSTOM ADDITIONS FOR ML & PROJECT SETUP
+# ==========================================
+
+# 1. Machine Learning Data & Datasets
+# Prevents committing the CIFAR-10/100 downloads
+data/
+datasets/
+
+# 2. PyTorch Model Weights & Checkpoints
+# Prevents bloating the repo with saved models
+*.pt
+*.pth
+*.ckpt
+
+# 3. Training Logs
+# Ignores TensorBoard and Weights & Biases logs generated during training
+runs/
+tb_logs/
+wandb/
+
+# 4. VS Code (Linux) Workspace Clutter
+# Ignores local workspace state but keeps shared debug/launch configs
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# 5. Editor / OS Temp Files
+# Ignores Vim swap files and Linux backup files
+*.swp
+*~
+.DS_Store
