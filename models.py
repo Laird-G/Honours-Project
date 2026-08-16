@@ -9,8 +9,8 @@ class NormalizedModel(nn.Module):
         self.register_buffer("mean", torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(std).view(1, 3, 1, 1))
 
-    def forward(self, x):
-        return self.base_model((x - self.mean) / self.std)
+    def forward(self, x, task_id=0):
+        return self.base_model((x - self.mean) / self.std, task_id=task_id)
 
 class BasicBlock(nn.Module):
     def __init__(self, in_planes, out_planes, stride, dropRate=0.0):
@@ -23,7 +23,7 @@ class BasicBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_planes, out_planes, 3, stride=1, padding=1, bias=False)
         self.droprate = dropRate
         self.shortcut = (
-            nn.Conv2d(in_planes, out_planes, 1, stride=stride, bias=False) 
+            nn.Conv2d(in_planes, out_planes, 1, stride=stride, bias=False)
             if stride != 1 or in_planes != out_planes else None
         )
 
@@ -37,18 +37,20 @@ class BasicBlock(nn.Module):
         return residual + self.conv2(out)
 
 class WideResNet(nn.Module):
-    def __init__(self, depth=28, num_classes=10, widen_factor=10, dropRate=0.0):
+    def __init__(self, depth=28, num_classes=10, widen_factor=10, dropRate=0.0, num_tasks=2):
         super().__init__()
         n = (depth - 4) // 6
         channels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
-        
+
         self.conv1 = nn.Conv2d(3, channels[0], 3, stride=1, padding=1, bias=False)
         self.layer1 = self._make_layer(channels[0], channels[1], n, 1, dropRate)
         self.layer2 = self._make_layer(channels[1], channels[2], n, 2, dropRate)
         self.layer3 = self._make_layer(channels[2], channels[3], n, 2, dropRate)
         self.bn = nn.BatchNorm2d(channels[3])
         self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(channels[3], num_classes)
+
+        # Head 0: Clean / Standard Task | Head 1: GPM Adversarial Task
+        self.heads = nn.ModuleList([nn.Linear(channels[3], num_classes) for _ in range(num_tasks)])
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -67,11 +69,11 @@ class WideResNet(nn.Module):
             in_planes = out_planes
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, task_id=0):
         out = self.conv1(x)
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.relu(self.bn(out))
         out = F.adaptive_avg_pool2d(out, (1, 1)).flatten(1)
-        return self.fc(out)
+        return self.heads[task_id](out)
