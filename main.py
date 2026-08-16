@@ -8,23 +8,23 @@ from models import WideResNet, NormalizedModel
 from methods import METHODS
 from trainer import train
 
+torch.backends.cudnn.benchmark = True
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="pgd_at", choices=list(METHODS.keys()))
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    trainloader, testloader, num_classes = get_dataloaders(args.dataset, args.batch_size)
+    trainloader, testloader, num_classes = get_dataloaders(args.dataset, args.batch_size, args.num_workers)
 
-    # Dataset normalization parameters
-    if args.dataset == "cifar100":
-        mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
-    else:
-        mean, std = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+    mean, std = ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)) if args.dataset == "cifar100" \
+        else ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
 
     base_model = WideResNet(depth=28, num_classes=num_classes, widen_factor=10)
     model = NormalizedModel(base_model, mean=mean, std=std).to(device)
@@ -41,6 +41,7 @@ def main():
         scheduler=scheduler,
         criterion=criterion,
         step_fn=METHODS[args.mode],
+        mode=args.mode,
         epochs=args.epochs,
         device=device,
         save_name=f"best_{args.mode}_{args.dataset}.pth"
