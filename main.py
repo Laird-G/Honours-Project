@@ -30,6 +30,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=None,
                         help="Epochs for standard clean/pgd_at training (default: 150 clean, 200 pgd_at)")
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--nesterov", action="store_true")
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--train_alpha", type=float, default=2/255,
+                        help="PGD-AT training step size (eps stays 8/255: threat model, not a hyperparameter)")
+    parser.add_argument("--train_steps", type=int, default=7,
+                        help="PGD-AT training attack steps")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--depth", type=int, default=28,
@@ -43,6 +51,13 @@ def main():
                         help="Cap on GPM Task 2 epochs. Matched to --epochs so the cap is not the "
                              "binding constraint and the Sec. 4.4.2 plateau rule decides when to stop; "
                              "keeps the adversarial-epoch budget comparable to the pgd_at arm.")
+    parser.add_argument("--lr_task2", type=float, default=0.01, help="GPM Task 2 SGD learning rate")
+    parser.add_argument("--plateau_factor", type=float, default=1/3,
+                        help="ReduceLROnPlateau decay factor for GPM Task 2")
+    parser.add_argument("--plateau_patience", type=int, default=5,
+                        help="ReduceLROnPlateau patience for GPM Task 2")
+    parser.add_argument("--gpm_alpha", type=float, default=2/255, help="GPM Task 2 training PGD step size")
+    parser.add_argument("--gpm_steps", type=int, default=10, help="GPM Task 2 training PGD steps")
     parser.add_argument("--gpm_samples", type=int, default=None,
                         help="Cap images used for GPM basis extraction (GPM uses ~1e2; "
                              "more samples flatten the spectrum and inflate k for a given l_th)")
@@ -71,8 +86,9 @@ def main():
         base_model = WideResNet(depth=args.depth, num_classes=num_classes, widen_factor=10, num_tasks=2)
         model = NormalizedModel(base_model, mean=mean, std=std).to(device)
 
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                              weight_decay=args.weight_decay, nesterov=args.nesterov)
         # Clean training follows Sharmin 2022 Sec. 4.4.2 (lr 0.1, x0.1 at 100
         # and 125) so that a checkpoint produced here is a valid Task 1 model
         # for the GPM pipeline. pgd_at keeps cosine annealing.
@@ -91,7 +107,9 @@ def main():
             mode=args.mode,
             epochs=args.epochs,
             device=device,
-            save_name=f"best_{args.mode}_{args.dataset}.pth"
+            save_name=f"best_{args.mode}_{args.dataset}.pth",
+            step_kwargs=({"alpha": args.train_alpha, "steps": args.train_steps}
+                         if args.mode == "pgd_at" else None),
         )
 
     elif args.mode == "gpm":
@@ -101,7 +119,7 @@ def main():
 
         base_model = WideResNet(depth=args.depth, num_classes=num_classes, widen_factor=10, num_tasks=2)
         model = NormalizedModel(base_model, mean=mean, std=std).to(device)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
         train_gpm_pipeline(
             model=model,
@@ -117,6 +135,12 @@ def main():
             save_name=f"best_gpm_th{args.threshold}_{args.dataset}.pth",
             gpm_samples=args.gpm_samples,
             no_oracle_eval=args.no_oracle_eval,
+            lr_task1=args.lr,
+            lr_task2=args.lr_task2,
+            plateau_factor=args.plateau_factor,
+            plateau_patience=args.plateau_patience,
+            adv_alpha=args.gpm_alpha,
+            adv_steps=args.gpm_steps,
         )
 
 

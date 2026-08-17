@@ -43,11 +43,20 @@ def freeze_backbone_bn(model):
             module.bias.requires_grad_(False)
 
 
-def evaluate(model, loader, device, task_id=0, attack_steps=0, eps=8/255, alpha=2/255, desc="Eval"):
+def evaluate(model, loader, device, task_id=0, attack_steps=0, eps=8/255, alpha=2/255, desc="Eval",
+             max_batches=None):
+    """max_batches truncates the evaluation to the first N batches.
+
+    Only for the hyperparameter search (tune.py), where a PGD-20 pass over the
+    full split dominates the cost of a short proxy run. Reported numbers must be
+    produced with max_batches=None.
+    """
     model.eval()
     correct, total = 0, 0
     pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
-    for x, y in pbar:
+    for i, (x, y) in enumerate(pbar):
+        if max_batches is not None and i >= max_batches:
+            break
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         if attack_steps > 0:
             x = pgd_attack(model, x, y, eps=eps, alpha=alpha, steps=attack_steps, random_start=True, task_id=task_id)
@@ -61,10 +70,22 @@ def evaluate(model, loader, device, task_id=0, attack_steps=0, eps=8/255, alpha=
 
 
 def train_standard(model, trainloader, testloader, optimizer, scheduler, criterion,
-                   step_fn, mode, epochs, device, save_name="best_model.pth"):
+                   step_fn, mode, epochs, device, save_name="best_model.pth",
+                   step_kwargs=None, eval_every=10, max_eval_batches=None,
+                   save_best=True, verbose=True):
+    """Standard single-task loop.
+
+    Returns the best metric of the run (clean accuracy for mode="clean",
+    PGD-20 accuracy otherwise) so a hyperparameter search can score it.
+
+    step_kwargs is forwarded to step_fn (e.g. the training attack's alpha/steps).
+    eval_every / max_eval_batches / save_best / verbose exist so tune.py can run
+    a cheap proxy without writing checkpoints; defaults reproduce the full run.
+    """
     scaler = GradScaler('cuda')
     best_metric = 0.0
     is_adversarial = (mode != "clean")
+    step_kwargs = step_kwargs or {}
 
     for epoch in range(epochs):
         model.train()
@@ -76,7 +97,7 @@ def train_standard(model, trainloader, testloader, optimizer, scheduler, criteri
             optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda'):
-                loss, outputs = step_fn(model, x, y, criterion, task_id=0)
+                loss, outputs = step_fn(model, x, y, criterion, task_id=0, **step_kwargs)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -88,36 +109,59 @@ def train_standard(model, trainloader, testloader, optimizer, scheduler, criteri
             pbar.set_postfix(loss=f"{train_loss/train_total:.3f}", acc=f"{100*train_correct/train_total:.1f}%")
 
         scheduler.step()
-        clean_acc = evaluate(model, testloader, device, task_id=0, attack_steps=0, desc="Eval Clean")
+        clean_acc = evaluate(model, testloader, device, task_id=0, attack_steps=0, desc="Eval Clean",
+                             max_batches=max_eval_batches)
 
         eval_str, save_flag = "", ""
         if not is_adversarial:
             if clean_acc > best_metric:
                 best_metric = clean_acc
-                torch.save(model.state_dict(), save_name)
-                save_flag = " -> Saved Best Clean Model!"
+                if save_best:
+                    torch.save(model.state_dict(), save_name)
+                    save_flag = " -> Saved Best Clean Model!"
         else:
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == epochs:
-                pgd20_acc = evaluate(model, testloader, device, task_id=0, attack_steps=20, desc="Eval PGD-20")
+            if (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs:
+                pgd20_acc = evaluate(model, testloader, device, task_id=0, attack_steps=20, desc="Eval PGD-20",
+                                     max_batches=max_eval_batches)
                 eval_str = f" | PGD-20: {100*pgd20_acc:.2f}%"
                 if pgd20_acc > best_metric:
                     best_metric = pgd20_acc
-                    torch.save(model.state_dict(), save_name)
-                    save_flag = " -> Saved Best Robust Model!"
+                    if save_best:
+                        torch.save(model.state_dict(), save_name)
+                        save_flag = " -> Saved Best Robust Model!"
 
-        print(f"Epoch [{epoch+1:03d}/{epochs:03d}] | Train Loss: {train_loss/train_total:.3f} "
-              f"| Clean Acc: {100*clean_acc:.2f}%{eval_str}{save_flag}", flush=True)
+        if verbose:
+            print(f"Epoch [{epoch+1:03d}/{epochs:03d}] | Train Loss: {train_loss/train_total:.3f} "
+                  f"| Clean Acc: {100*clean_acc:.2f}%{eval_str}{save_flag}", flush=True)
 
-    if is_adversarial:
+    if is_adversarial and verbose:
         # Logged so the adversarial-epoch budget can be compared against the
         # GPM arm, which stops on its own plateau criterion.
         print(f"\nAdversarial epochs completed: {epochs} | Best PGD-20: {100*best_metric:.2f}%", flush=True)
 
+    return best_metric
+
 
 def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
                        threshold, clean_checkpoint, epochs_task1, epochs_task2, device, save_name,
-                       gpm_samples=None, no_oracle_eval=False):
+                       gpm_samples=None, no_oracle_eval=False,
+                       lr_task1=0.1, lr_task2=0.01, plateau_factor=1/3, plateau_patience=5,
+                       adv_alpha=2/255, adv_steps=10, save_best=True, verbose=True,
+                       final_eval_loader=None, final_attack_steps=20, max_eval_batches=None):
+    """Three-stage GPM pipeline. Returns a dict of the run's headline metrics.
+
+    The searchable knobs are threshold, lr_task2, the ReduceLROnPlateau shape
+    (plateau_factor / plateau_patience), the Task 2 attack solver
+    (adv_alpha / adv_steps) and gpm_samples. momentum and weight decay are
+    deliberately *not* exposed: Sec. 4.4.2 fixes both at 0 because SGD applies
+    them after the projection, which would re-inject the interference the
+    projection removes.
+
+    save_best / verbose / final_eval_loader / final_attack_steps /
+    max_eval_batches exist for tune.py; the defaults reproduce the full run.
+    """
     scaler = GradScaler('cuda')
+    final_eval_loader = final_eval_loader if final_eval_loader is not None else testloader
 
     # ---------------------------------------------------------
     # STAGE 1: Clean Baseline Training (or Checkpoint Loading)
@@ -142,7 +186,7 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
         print("=" * 70, flush=True)
 
         model.base_model.heads[1].requires_grad_(False)
-        opt_t1 = optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1, momentum=0.9, weight_decay=5e-4)
+        opt_t1 = optim.SGD([p for p in model.parameters() if p.requires_grad], lr=lr_task1, momentum=0.9, weight_decay=5e-4)
         sched_t1 = optim.lr_scheduler.MultiStepLR(opt_t1, milestones=[100, 125], gamma=0.1)
 
         for epoch in range(epochs_task1):
@@ -174,36 +218,40 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
         torch.save(model.state_dict(), "task1_clean_backbone.pth")
         print(" -> Saved Task 1 backbone to task1_clean_backbone.pth", flush=True)
 
-    task1_clean_acc = evaluate(model, testloader, device, task_id=0, attack_steps=0, desc="Task 1 Clean")
+    task1_clean_acc = evaluate(model, final_eval_loader, device, task_id=0, attack_steps=0,
+                               desc="Task 1 Clean", max_batches=max_eval_batches)
     print(f" -> Task 1 clean accuracy (pre-GPM reference): {task1_clean_acc*100:.2f}%", flush=True)
 
     # ---------------------------------------------------------
     # STAGE 2: SVD Representation Extraction
     # ---------------------------------------------------------
-    print("\n" + "=" * 70, flush=True)
-    print(f"[STAGE 2/3] Extracting SVD Bases (Threshold l_th = {threshold})", flush=True)
-    print("=" * 70, flush=True)
+    if verbose:
+        print("\n" + "=" * 70, flush=True)
+        print(f"[STAGE 2/3] Extracting SVD Bases (Threshold l_th = {threshold})", flush=True)
+        print("=" * 70, flush=True)
     gpm_bases, gpm_stats = get_gpm_bases(
         model, valloader, device, threshold=threshold, task_id=0,
         max_samples=gpm_samples, return_stats=True,
     )
-    print(f" -> Extracted orthogonal basis tensors for {len(gpm_bases)} convolution layers.", flush=True)
-
     # k/n per layer -- this is the data behind Fig. 4.8 and the principal
     # component regions of Fig. 4.9.
     total_k = sum(k for k, _ in gpm_stats.values())
     total_n = sum(n for _, n in gpm_stats.values())
-    print(f" -> Salient subspace size (k/n) per layer at l_th = {threshold}:", flush=True)
-    for name, (k, n) in gpm_stats.items():
-        print(f"      {name:<40s} k={k:>5d} / n={n:>5d}  ({100.0*k/n:5.1f}%)", flush=True)
+    if verbose:
+        print(f" -> Extracted orthogonal basis tensors for {len(gpm_bases)} convolution layers.", flush=True)
+        print(f" -> Salient subspace size (k/n) per layer at l_th = {threshold}:", flush=True)
+        for name, (k, n) in gpm_stats.items():
+            print(f"      {name:<40s} k={k:>5d} / n={n:>5d}  ({100.0*k/n:5.1f}%)", flush=True)
     print(f" -> Aggregate: k/n = {total_k}/{total_n} ({100.0*total_k/total_n:.1f}%)", flush=True)
 
     # ---------------------------------------------------------
     # STAGE 3: GPM-Constrained Adversarial Training (Task 2)
     # ---------------------------------------------------------
-    print("\n" + "=" * 70, flush=True)
-    print(f"[STAGE 3/3] GPM-Constrained PGD-10 Adversarial Training (Max {epochs_task2} Epochs)", flush=True)
-    print("=" * 70, flush=True)
+    if verbose:
+        print("\n" + "=" * 70, flush=True)
+        print(f"[STAGE 3/3] GPM-Constrained PGD-{adv_steps} Adversarial Training "
+              f"(Max {epochs_task2} Epochs)", flush=True)
+        print("=" * 70, flush=True)
 
     model.base_model.heads[0].requires_grad_(False)
     model.base_model.heads[1].requires_grad_(True)
@@ -211,8 +259,9 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
     freeze_backbone_bn(model)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f" -> Backbone BatchNorm frozen (affine + running stats). "
-          f"{len(trainable)} trainable tensors in Task 2.", flush=True)
+    if verbose:
+        print(f" -> Backbone BatchNorm frozen (affine + running stats). "
+              f"{len(trainable)} trainable tensors in Task 2.", flush=True)
 
     # Sec. 4.4.2: momentum = 0 and weight decay = 0, "in order to avoid
     # distorting the gradient direction after projecting in the orthogonal
@@ -220,8 +269,9 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
     # inside SGD.step(), i.e. *after* the projection, and w has a large
     # component inside the salient space -- it would re-inject exactly the
     # interference the projection removes.
-    opt_t2 = optim.SGD(trainable, lr=0.01, momentum=0.0, weight_decay=0.0)
-    sched_t2 = optim.lr_scheduler.ReduceLROnPlateau(opt_t2, mode='max', factor=1/3, patience=5, min_lr=MIN_LR)
+    opt_t2 = optim.SGD(trainable, lr=lr_task2, momentum=0.0, weight_decay=0.0)
+    sched_t2 = optim.lr_scheduler.ReduceLROnPlateau(opt_t2, mode='max', factor=plateau_factor,
+                                                    patience=plateau_patience, min_lr=MIN_LR)
 
     best_val_acc = -1.0        # so epoch 1 always writes a checkpoint
     epochs_run = 0
@@ -236,7 +286,8 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
 
         for step, (x, y) in enumerate(pbar):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            x_adv = pgd_attack(model, x, y, eps=8/255, alpha=2/255, steps=10, random_start=True, task_id=1)
+            x_adv = pgd_attack(model, x, y, eps=8/255, alpha=adv_alpha, steps=adv_steps,
+                               random_start=True, task_id=1)
 
             opt_t2.zero_grad(set_to_none=True)
             with autocast('cuda'):
@@ -264,17 +315,19 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
             train_total += y.size(0)
             pbar.set_postfix(adv_loss=f"{train_loss/train_total:.3f}", adv_acc=f"{100*train_correct/train_total:.1f}%")
 
-        val_acc = evaluate(model, valloader, device, task_id=1, attack_steps=10, desc="Val PGD-10")
+        val_acc = evaluate(model, valloader, device, task_id=1, attack_steps=10, desc="Val PGD-10",
+                           max_batches=max_eval_batches)
         sched_t2.step(val_acc)
         current_lr = opt_t2.param_groups[0]['lr']
         proj_ratio = (norm_ratio_sum / norm_ratio_n) if norm_ratio_n else float('nan')
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), save_name)
+            if save_best:
+                torch.save(model.state_dict(), save_name)
 
         converged = current_lr <= MIN_LR * (1 + 1e-6)
-        if (epoch + 1) % 5 == 0 or converged or (epoch + 1) == epochs_task2:
+        if verbose and ((epoch + 1) % 5 == 0 or converged or (epoch + 1) == epochs_task2):
             # proj_ratio is mean_layers(||G'|| / ||G||): near 0 means the
             # adversarial gradient lies almost entirely inside the clean
             # salient space (Fig. 4.5a behaviour at high l_th).
@@ -286,19 +339,22 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
             break
 
     # Final Benchmark Evaluation
-    print("\n" + "=" * 70, flush=True)
-    print(" Final Benchmark Verification", flush=True)
-    print("=" * 70, flush=True)
+    if verbose:
+        print("\n" + "=" * 70, flush=True)
+        print(" Final Benchmark Verification", flush=True)
+        print("=" * 70, flush=True)
 
     # Benchmark the checkpoint that was actually selected, not the last epoch.
     # The PGD-AT arm reports a best-of-run number, so reporting last-epoch here
     # would compare best-of-run against a last-epoch snapshot.
-    if os.path.exists(save_name):
+    if save_best and os.path.exists(save_name):
         print(f" -> Restoring best-validation checkpoint: {save_name}", flush=True)
         model.load_state_dict(torch.load(save_name, map_location=device))
 
-    final_clean = evaluate(model, testloader, device, task_id=0, attack_steps=0, desc="Final Clean Head 0")
-    final_pgd20 = evaluate(model, testloader, device, task_id=1, attack_steps=20, desc="Final PGD-20 Head 1")
+    final_clean = evaluate(model, final_eval_loader, device, task_id=0, attack_steps=0,
+                           desc="Final Clean Head 0", max_batches=max_eval_batches)
+    final_pgd20 = evaluate(model, final_eval_loader, device, task_id=1, attack_steps=final_attack_steps,
+                           desc=f"Final PGD-{final_attack_steps} Head 1", max_batches=max_eval_batches)
     print(f"Threshold (l_th)      : {threshold}", flush=True)
     print(f"Salient subspace k/n  : {total_k}/{total_n} ({100.0*total_k/total_n:.1f}%)", flush=True)
     print(f"Task 1 Clean Acc      : {task1_clean_acc * 100:.2f}%  (before GPM training)", flush=True)
@@ -326,8 +382,8 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
         print(" OPTIONAL: no-oracle read (each row is one deployable classifier)", flush=True)
         print("-" * 70, flush=True)
 
-        h1_clean = evaluate(model, testloader, device, task_id=1, attack_steps=0, desc="Clean Head 1")
-        h0_pgd20 = evaluate(model, testloader, device, task_id=0, attack_steps=20, desc="PGD-20 Head 0")
+        h1_clean = evaluate(model, final_eval_loader, device, task_id=1, attack_steps=0, desc="Clean Head 1")
+        h0_pgd20 = evaluate(model, final_eval_loader, device, task_id=0, attack_steps=20, desc="PGD-20 Head 0")
 
         print(f"{'':<24s}{'Clean':>10s}{'PGD-20':>10s}", flush=True)
         print(f"{'head 0 (g_clean)':<24s}{final_clean*100:>9.2f}%{h0_pgd20*100:>9.2f}%", flush=True)
@@ -338,3 +394,14 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
         print(f" Robustness of head 0      : {h0_pgd20*100:.2f}% "
               f"(did the constrained backbone update confer any robustness on the frozen clean head?)",
               flush=True)
+
+    return {
+        "threshold": threshold,
+        "k": total_k,
+        "n": total_n,
+        "task1_clean": task1_clean_acc,
+        "final_clean": final_clean,
+        "final_robust": final_pgd20,
+        "best_val_robust": best_val_acc,
+        "epochs_run": epochs_run,
+    }
