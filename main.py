@@ -8,7 +8,7 @@ import torch.optim as optim
 from dataset import get_dataloaders
 from models import WideResNet, NormalizedModel
 from methods import METHODS
-from ogp import make_reference_loaders
+from ogp import split_reference_and_selection
 from trainer import train_standard, train_gpm_pipeline, train_ogp_pipeline
 
 torch.backends.cudnn.benchmark = True
@@ -74,20 +74,59 @@ def main():
     parser.add_argument("--ogp_lr", type=float, default=0.01, help="OGP fine-tune learning rate")
     parser.add_argument("--ogp_refresh", type=int, default=30,
                         help="K: subspace refresh period in steps (paper: 30 for SFT, 5 for DPO)")
-    parser.add_argument("--ogp_num_refs", type=int, default=8,
-                        help="M: number of reference pools (increased from 2 to 8 for rich class coverage)")
+    parser.add_argument("--ogp_num_refs", type=int, default=4,
+                        help="M: number of reference pools (paper: 2). Total directions = "
+                             "M x len(--ogp_ref); each costs 146 MB of basis for WRN-28-10")
     parser.add_argument("--ogp_ref_samples", type=int, default=256,
-                        help="Images per reference set D_ref^(i)")
-    parser.add_argument("--ogp_ref_batch", type=int, default=64,
-                        help="Batch B^(i) drawn from each reference set per refresh")
+                        help="Images per reference set D_ref^(i) (paper: 200)")
+    parser.add_argument("--ogp_ref_batch", type=int, default=128,
+                        help="Batch B^(i) drawn from each reference set per refresh (paper: 128)")
     parser.add_argument("--ogp_delta", type=float, default=0.05,
-                        help="Gram-Schmidt collinearity threshold (eq. 11)")
+                        help="Gram-Schmidt collinearity threshold (eq. 11). Relative, because "
+                             "reference gradients are unit-normalised before orthogonalising")
     parser.add_argument("--ogp_warmup_ratio", type=float, default=0.1,
-                        help="Fraction of total steps spent in linear LR warm-up")
-    parser.add_argument("--ogp_anchor_weight", type=float, default=0.01,
-                        help="L2 weight anchor lambda toward theta_pre to guard against Hessian curvature drift")
+                        help="Fraction of total steps spent in linear LR warm-up (paper: 0.1)")
+    parser.add_argument("--ogp_ref", type=str, default="both", choices=["ce", "kl", "both"],
+                        help="Reference objective. ce = clean cross-entropy (paper-faithful, but "
+                             "near-vanishing on a converged model); kl = KL to a frozen copy of "
+                             "the clean model, the direction that undoes clean-function drift; "
+                             "both = a genuinely rank-2-per-pool subspace of two distinct facets")
+    parser.add_argument("--ogp_per_class", action="store_true",
+                        help="One reference direction per class (masked backwards on a single "
+                             "mixed batch) instead of one per pool -- the strongest facet "
+                             "diversity available when the task has only one 'capability'")
+    parser.add_argument("--ogp_project", type=str, default="inequality",
+                        choices=["equality", "inequality"],
+                        help="equality = eq. 12, remove the whole component (preserves the "
+                             "reference loss). inequality = GEM dual QP, remove only what would "
+                             "RAISE it -- the correct constraint for a trade-off, and a strict "
+                             "generalisation of equality")
+    parser.add_argument("--ogp_granularity", type=str, default="global",
+                        choices=["global", "per_tensor"],
+                        help="global = one subspace over the whole parameter vector (paper). "
+                             "per_tensor = M' constraints per tensor, a strictly stronger "
+                             "constraint and the rung toward GPM's per-layer structure")
+    parser.add_argument("--ogp_alpha", type=float, default=1.0,
+                        help="Scales the correction. 1 = full projection; 0 = unconstrained "
+                             "control that still logs the conflict it would have removed; "
+                             "sweep it to trace the trade-off frontier")
+    parser.add_argument("--ogp_renorm", action="store_true",
+                        help="Rescale the projected gradient back to ||g||. Removes the "
+                             "effective-learning-rate confound and matches eq. 16 / Prop. 4.1, "
+                             "which is stated for the UNIT steepest feasible direction")
+    parser.add_argument("--ogp_anchor_weight", type=float, default=0.0,
+                        help="Optional L2 anchor lambda*(theta - theta_pre), added BEFORE the "
+                             "projection. Default 0: a non-zero value is a second, independent "
+                             "protection mechanism, so leaving it on would confound the "
+                             "projection's effect with the anchor's")
     parser.add_argument("--ogp_ref_temp", type=float, default=2.0,
-                        help="Temperature scaling tau for reference gradients to prevent zero-gradient collapse")
+                        help="Temperature tau on the logits for reference losses. tau > 1 keeps "
+                             "the clean CE gradient from collapsing on well-fit data; it is also "
+                             "the standard distillation temperature for the kl objective")
+    parser.add_argument("--ogp_select", type=str, default="tradeoff",
+                        choices=["tradeoff", "robust", "clean", "none"],
+                        help="Checkpoint selection on the held-out selection split. tradeoff = "
+                             "0.5*(clean + robust); none = keep the last epoch, as the paper does")
 
     parser.add_argument("--no_oracle_eval", action="store_true",
                         help="Also report the full head x {clean, PGD-20} matrix. The headline "
@@ -179,14 +218,23 @@ def main():
         model = NormalizedModel(base_model, mean=mean, std=std).to(device)
         criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-        # Build diverse reference pools from clean un-augmented validation data
-        ref_loaders = make_reference_loaders(
+        # Three-way separation: the training split is fine-tuned on, the
+        # reference pools steer the projection, and a disjoint selection split
+        # picks the checkpoint. Reference data must be held out (a converged
+        # model has ~0 loss on its training data, so the clean gradient there is
+        # noise) yet must not be the data that also scores the checkpoint.
+        ref_loaders, selection_loader = split_reference_and_selection(
             valloader,
             num_refs=args.ogp_num_refs,
             ref_samples=args.ogp_ref_samples,
             ref_batch=args.ogp_ref_batch,
+            eval_batch_size=args.batch_size,
+            num_workers=args.num_workers,
             seed=args.seed + 1234,
         )
+        objectives = ("ce", "kl") if args.ogp_ref == "both" else (args.ogp_ref,)
+        tag = (f"ogp_{args.ogp_ref}_{args.ogp_project[:3]}_{args.ogp_granularity[:3]}"
+               f"_a{args.ogp_alpha}_M{args.ogp_num_refs}_K{args.ogp_refresh}")
 
         train_ogp_pipeline(
             model=model,
@@ -204,10 +252,19 @@ def main():
             adv_alpha=args.train_alpha,
             adv_steps=args.train_steps,
             device=device,
-            save_name=f"final_ogp_K{args.ogp_refresh}_M{args.ogp_num_refs}_{args.dataset}.pth",
+            save_name=f"best_{tag}_{args.dataset}.pth",
             task_id=0,
-            anchor_weight=args.ogp_anchor_weight,
+            objectives=objectives,
+            per_class=args.ogp_per_class,
+            num_classes=num_classes,
             ref_temp=args.ogp_ref_temp,
+            project_mode=args.ogp_project,
+            granularity=args.ogp_granularity,
+            proj_alpha=args.ogp_alpha,
+            renorm=args.ogp_renorm,
+            anchor_weight=args.ogp_anchor_weight,
+            select=args.ogp_select,
+            selection_loader=selection_loader,
             verbose=True,
         )
 

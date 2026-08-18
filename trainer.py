@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import torch
@@ -7,8 +8,7 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from attacks import pgd_attack
 from gpm import get_gpm_bases, project_backbone_gradients
-from ogp import (gram_schmidt, project_orthogonal, reference_gradients,
-                 selfcheck as ogp_selfcheck, flat_dot, flat_norm)
+from ogp import ReferenceSubspace, reference_gradients, flat_dot, flat_norm
 
 MIN_LR = 1e-7
 PROJ_NORM_LOG_EVERY = 50
@@ -39,6 +39,33 @@ def freeze_backbone_bn(model):
             module.eval()
             module.weight.requires_grad_(False)
             module.bias.requires_grad_(False)
+
+
+def freeze_bn_stats(model):
+    """Stop BatchNorm running-stat updates, but leave the affine params trainable.
+
+    The OGP counterpart of freeze_backbone_bn, and the difference is deliberate.
+    GPM must also freeze BN *affine* weights because it has no patch-space basis
+    to project their gradients against, so they would be an unprojected escape
+    hatch. OGP builds its subspace in parameter space and projects EVERY
+    trainable tensor, BN affine included -- so freezing them would throw away
+    capacity for no protection benefit.
+
+    running_mean / running_var are a different matter in both methods: they are
+    buffers updated inside forward(), ignoring requires_grad, the optimizer and
+    any projection. Left in train mode during adversarial fine-tuning they track
+    the adversarial input distribution, which moves the clean function no matter
+    what the gradients do. eval() is the only way to hold them.
+
+    Side benefit: with BN in eval the training-time function equals the deployed
+    function, so the reference gradient is exact and the attack is generated
+    against the model that will actually be shipped.
+
+    Must be re-applied after every model.train(). Idempotent.
+    """
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
 
 
 def evaluate(model, loader, device, task_id=0, attack_steps=0, eps=8/255, alpha=2/255, desc="Eval",
@@ -304,43 +331,83 @@ def train_gpm_pipeline(model, trainloader, valloader, testloader, criterion,
 def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref_loaders,
                        clean_checkpoint, epochs, lr, refresh_every, delta, warmup_ratio,
                        adv_alpha, adv_steps, device, save_name, task_id=0,
-                       anchor_weight=0.01, ref_temp=2.0, verbose=True):
-    """OGPSA with Vision Stability Fixes[cite: 1, 3].
+                       objectives=("ce", "kl"), per_class=False, num_classes=10,
+                       ref_temp=2.0, project_mode="equality", granularity="global",
+                       proj_alpha=1.0, renorm=False, anchor_weight=0.0,
+                       select="tradeoff", selection_loader=None, verbose=True):
+    """OGP as a single-head adversarial fine-tune of a clean checkpoint.
 
-    KEY IMPROVEMENTS:
-    1. FREEZE BATCHNORM: running_mean/var are frozen so adversarial perturbations
-       cannot overwrite clean normalization statistics[cite: 3].
-    2. L2 WEIGHT ANCHOR: Adds (anchor_weight)*||theta - theta_pre|| to bound higher-order
-       Hessian curvature drift outside the clean basin[cite: 1].
-    3. TEMPERATURE-SCALED REFERENCE GRADIENTS: Prevents zero-gradient collapse at clean convergence[cite: 3].
+    Set --ogp_ref ce --ogp_project equality --ogp_granularity global
+    --ogp_alpha 1 --ogp_anchor_weight 0 to recover the paper's Algorithm 1;
+    every other setting is an extension documented in ogp.py's module docstring.
+
+    Single head throughout, so clean and PGD-20 accuracy come off the SAME
+    deployable classifier -- no task oracle, directly comparable to the pgd_at
+    arm. That is the structural advantage over train_gpm_pipeline, whose headline
+    numbers pair head 0's clean accuracy with head 1's robustness.
     """
     print("\n" + "=" * 70, flush=True)
     print(f"[STAGE 1/2] Loading pre-alignment checkpoint: {clean_checkpoint}", flush=True)
     print("=" * 70, flush=True)
     load_clean_checkpoint(model, clean_checkpoint, device)
 
-    # Use single Head 0 for a directly deployable classifier
+    selection_loader = selection_loader if selection_loader is not None else valloader
+
+    # Single head 0 -> one deployable classifier. Head 1 is never in the forward
+    # pass, so including it would only put a permanently-None gradient in the
+    # parameter list.
     model.base_model.heads[1].requires_grad_(False)
     model.base_model.heads[0].requires_grad_(True)
 
-    # CRITICAL FIX 1: Freeze BatchNorm running stats and affine parameters[cite: 3]
-    freeze_backbone_bn(model)
+    # Stats frozen, affine trainable -- see freeze_bn_stats. This closes the one
+    # leak a gradient projection provably cannot: running_mean / running_var are
+    # buffers, so nothing in eq. 12 can stop them tracking the adversarial
+    # distribution.
+    freeze_bn_stats(model)
+
+    # theta_0 for the KL reference objective: a frozen copy of the clean model,
+    # which is what "general capability" means concretely here.
+    teacher = None
+    if "kl" in objectives:
+        teacher = copy.deepcopy(model).eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
 
     params = [p for p in model.parameters() if p.requires_grad]
     n_param = sum(p.numel() for p in params)
-    print(f" -> BatchNorm frozen. Projecting over {len(params)} tensors / {n_param:,} parameters.", flush=True)
 
-    # Cache pre-trained weights for the L2 proximity anchor[cite: 1]
-    theta_pre = [p.detach().clone() for p in params]
+    n_dir = (num_classes if per_class else len(ref_loaders)) * len(objectives)
+    basis_gb = n_dir * n_param * 4 / 1024 ** 3
+    print(f" -> BN stats frozen, BN affine trainable ({len(params)} tensors / "
+          f"{n_param:,} parameters, all projected).", flush=True)
+    print(f" -> Reference objectives {list(objectives)} x "
+          f"{'per-class facets' if per_class else f'{len(ref_loaders)} pools'} "
+          f"= up to {n_dir} directions "
+          f"(~{basis_gb:.2f} GB basis + the same again transiently per refresh).", flush=True)
+
+    subspace = ReferenceSubspace(
+        params, granularity=granularity, delta=delta, mode=project_mode,
+        alpha=proj_alpha, renorm=renorm,
+    )
+
+    # theta_pre for the optional L2 anchor.
+    theta_pre = [p.detach().clone() for p in params] if anchor_weight > 0 else None
 
     pre_clean = evaluate(model, testloader, device, task_id=task_id, attack_steps=0, desc="Pre-align Clean")
     print(f" -> Pre-alignment clean accuracy: {pre_clean*100:.2f}%", flush=True)
 
     print("\n" + "=" * 70, flush=True)
-    print(f"[STAGE 2/2] OGP-Constrained PGD-{adv_steps} Fine-Tune ({epochs} Epochs, "
-          f"K = {refresh_every}, M = {len(ref_loaders)}, Anchor = {anchor_weight}, Temp = {ref_temp})", flush=True)
+    print(f"[STAGE 2/2] OGP-Constrained PGD-{adv_steps} Fine-Tune ({epochs} Epochs)", flush=True)
+    print(f"    K = {refresh_every} | project = {project_mode} | granularity = {granularity} "
+          f"| alpha = {proj_alpha} | renorm = {renorm} | tau = {ref_temp} "
+          f"| anchor = {anchor_weight} | delta = {delta}", flush=True)
     print("=" * 70, flush=True)
 
+    # Algorithm 1 line 12 is plain gradient descent, and Appendix A sets weight
+    # decay to 0. Both matter here: SGD applies momentum and decay *after* the
+    # projection, and theta has a large component along the reference
+    # directions, so decay would re-inject exactly what eq. 12 removed. Same
+    # reasoning as train_gpm_pipeline's opt_t2.
     opt = optim.SGD(params, lr=lr, momentum=0.0, weight_decay=0.0)
 
     steps_per_epoch = len(trainloader)
@@ -356,40 +423,57 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
     sched = optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     scaler = GradScaler('cuda')
 
-    basis, residuals = [], []
     refreshes, skipped_refreshes = 0, 0
     diagnosed, checked = False, False
     global_step = 0
+    best_score, best_epoch = -1.0, 0
+    history = []
 
     for epoch in range(epochs):
         model.train()
-        # Must re-freeze BN because model.train() enables all submodules[cite: 3]
-        freeze_backbone_bn(model)
+        freeze_bn_stats(model)      # model.train() just re-enabled every module
 
         train_loss, train_correct, train_total = 0.0, 0, 0
-        ratio_sum, ratio_n = 0.0, 0
-        last_cosines = []
+        ratio_sum, span_sum, ratio_n = 0.0, 0.0, 0
+        active_sum, fallbacks, last_cosines = 0, 0, []
 
         pbar = tqdm(trainloader, desc=f"OGP [{epoch+1:03d}/{epochs:03d}]", leave=False, dynamic_ncols=True)
         for x, y in pbar:
-            # Refresh reference subspace with temperature-scaled gradients[cite: 1, 2, 3]
-            if global_step % refresh_every == 0:
-                grads = reference_gradients(
-                    model, ref_loaders, criterion, params, device,
-                    task_id=task_id, temperature=ref_temp
+            # ---- Algorithm 1 lines 3-9: refresh the subspace every K steps ----
+            if global_step % refresh_every == 0 and ref_loaders:
+                grads, labels = reference_gradients(
+                    model, ref_loaders, params, device, task_id=task_id,
+                    objectives=objectives, temperature=ref_temp, criterion=criterion,
+                    teacher=teacher, per_class=per_class, num_classes=num_classes,
                 )
-                ref_norms = [flat_norm(g) for g in grads]
-
-                if all(math.isfinite(n) for n in ref_norms):
-                    if not diagnosed:
-                        print(f" -> First refresh: ||g_ref|| = "
-                              f"{', '.join(f'{n:.3e}' for n in ref_norms)}", flush=True)
-                        diagnosed = True
-
-                    basis, residuals = gram_schmidt(grads, delta=delta)
-                    refreshes += 1
-                else:
+                rank = subspace.build(grads, labels)
+                if rank is None:
+                    # Non-finite reference gradient. The basis is lagged by
+                    # design, so keeping the previous one beats projecting
+                    # against garbage.
                     skipped_refreshes += 1
+                else:
+                    refreshes += 1
+                    if not diagnosed:
+                        # The single most informative line in the run. Tiny norms
+                        # mean the reference direction is mini-batch noise; a
+                        # pairwise cosine near 1 means M pools collapsed to one
+                        # direction. Both are the failure modes ogp.py's
+                        # docstring describes.
+                        print(" -> First refresh diagnostics:", flush=True)
+                        for lab, n in zip(labels, subspace.ref_norms):
+                            print(f"      ||g_ref[{lab}]|| = {n:.4e}", flush=True)
+                        for i in range(len(grads)):
+                            for j in range(i + 1, len(grads)):
+                                d = subspace.ref_norms[i] * subspace.ref_norms[j]
+                                if d > 0:
+                                    print(f"      cos({labels[i]}, {labels[j]}) = "
+                                          f"{flat_dot(grads[i], grads[j]) / d:+.4f}", flush=True)
+                        print(f"      retained rank M' = {rank} of {len(grads)} "
+                              f"({subspace.dropped_weak} dropped as vanishing, "
+                              f"residuals "
+                              f"{', '.join(f'{r:.3f}' for r in subspace.residuals)})", flush=True)
+                        diagnosed = True
                 del grads
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -402,32 +486,49 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
                 loss = criterion(outputs, y)
 
             scaler.scale(loss).backward()
+            # Unscale before projecting: the projection subtracts a multiple of a
+            # basis vector from EVERY coordinate, so one overflowed element would
+            # be smeared across the whole gradient. Unscaling first also stops
+            # scaler.step() from unscaling a second time.
             scaler.unscale_(opt)
 
-            # Orthogonal projection[cite: 1, 2]
-            if basis:
-                want_stats = (global_step % PROJ_NORM_LOG_EVERY == 0) or not checked
-                stats = project_orthogonal(basis, params, return_stats=want_stats)
-                if stats is not None:
-                    before, after, cosines = stats
-                    if before > 0:
-                        ratio_sum += after / before
-                        ratio_n += 1
-                        last_cosines = cosines
-
-                if not checked:
-                    gram_err, resid, ok = ogp_selfcheck(basis, params)
-                    print(f" -> Self-check: max|U^T U - I| = {gram_err:.2e}, "
-                          f"max|<u_j, g'>|/||g'|| = {resid:.2e} -> "
-                          f"{'PASS' if ok else 'WARN'}", flush=True)
-                    checked = True
-
-            # CRITICAL FIX 2: L2 Proximity Anchor (Curvature Barrier)[cite: 1]
+            # The anchor gradient goes in BEFORE the projection, not after.
+            # lambda*(theta - theta_0) points along the drift the projection is
+            # trying to prevent, so adding it afterwards would re-inject exactly
+            # the salient-space component eq. 12 just removed -- the same trap as
+            # weight decay. Added first, it is projected like any other gradient.
             if anchor_weight > 0:
                 with torch.no_grad():
                     for p, p0 in zip(params, theta_pre):
-                        if p.grad is not None:
-                            p.grad.add_(p - p0, alpha=anchor_weight)
+                        p.grad.add_(p.detach() - p0, alpha=anchor_weight)
+
+            if subspace.rank:
+                want_stats = (global_step % PROJ_NORM_LOG_EVERY == 0) or not checked
+                stats = subspace.project(params, return_stats=want_stats)
+                if stats is not None and stats["before"] > 0:
+                    ratio_sum += stats["ratio"]
+                    span_sum += stats["frac_in_span"]
+                    ratio_n += 1
+                    active_sum += stats["n_active"]
+                    fallbacks += stats["n_fallback"]
+                    last_cosines = stats["cosines"]
+
+                if not checked:
+                    chk = subspace.selfcheck(
+                        params, scale=stats["before"] if stats else None)
+                    print(f" -> Self-check ({project_mode}): max|U^T U - I| = "
+                          f"{chk['gram_err']:.2e}, {chk['detail']} -> "
+                          f"{'PASS' if chk['ok'] else 'WARN'}", flush=True)
+                    if max(chk["gram_err"], abs(min(0.0, chk["feas"]))) > 1e-2:
+                        raise RuntimeError(
+                            f"OGP self-check failed badly ({chk}): the basis is not "
+                            f"orthonormal or the projected gradient violates its constraint. "
+                            f"Every number this run produces would be meaningless."
+                        )
+                    if not chk["ok"]:
+                        print("    WARNING: above tolerance but below the abort threshold -- "
+                              "continuing, but treat the projection as suspect.", flush=True)
+                    checked = True
 
             scaler.step(opt)
             scaler.update()
@@ -440,42 +541,95 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
             pbar.set_postfix(adv_loss=f"{train_loss/train_total:.3f}",
                              adv_acc=f"{100*train_correct/train_total:.1f}%")
 
-        val_clean = evaluate(model, valloader, device, task_id=task_id, attack_steps=0, desc="Val Clean")
-        val_adv = evaluate(model, valloader, device, task_id=task_id, attack_steps=10, desc="Val PGD-10")
+        # Scored on the selection split, which is disjoint from the reference
+        # pools -- otherwise the data that steered the projection would also pick
+        # the checkpoint.
+        val_clean = evaluate(model, selection_loader, device, task_id=task_id,
+                             attack_steps=0, desc="Val Clean")
+        val_adv = evaluate(model, selection_loader, device, task_id=task_id,
+                           attack_steps=10, desc="Val PGD-10")
 
-        # Track Euclidean parameter distance from the clean checkpoint
-        with torch.no_grad():
-            dist_from_pre = math.sqrt(sum((p - p0).norm().item()**2 for p, p0 in zip(params, theta_pre)))
+        if theta_pre is not None:
+            with torch.no_grad():
+                drift = math.sqrt(sum(float((p - p0).norm()) ** 2
+                                      for p, p0 in zip(params, theta_pre)))
+        else:
+            drift = float('nan')
+
+        # Selecting on robustness alone would pick the most-forgetting epoch,
+        # which is the opposite of what this arm is for.
+        saved = ""
+        if select == "none":
+            # The paper reports the final model after a fixed budget; the
+            # end-of-run _last.pth write covers it, so don't churn 146 MB/epoch.
+            best_epoch = epoch + 1
+        else:
+            score = {"tradeoff": 0.5 * (val_clean + val_adv),
+                     "robust": val_adv,
+                     "clean": val_clean}[select]
+            if score > best_score:
+                best_score, best_epoch = score, epoch + 1
+                torch.save(model.state_dict(), save_name)
+                saved = " -> saved"
+
+        proj_ratio = (ratio_sum / ratio_n) if ratio_n else float('nan')
+        frac_span = (span_sum / ratio_n) if ratio_n else float('nan')
+        history.append({"epoch": epoch + 1, "val_clean": val_clean, "val_robust": val_adv,
+                        "ratio": proj_ratio, "frac_in_span": frac_span, "drift": drift})
 
         if verbose:
-            proj_ratio = (ratio_sum / ratio_n) if ratio_n else float('nan')
             cos_str = ", ".join(f"{c:+.3f}" for c in last_cosines[:4]) if last_cosines else "n/a"
+            extra = f" | GEM active/step: {active_sum/max(1,ratio_n):.1f}" \
+                    if project_mode == "inequality" else ""
+            if fallbacks:
+                extra += f" | QP fallbacks: {fallbacks}"
             print(f"OGP Epoch [{epoch+1:03d}/{epochs:03d}] | Val Clean: {val_clean*100:.2f}% "
-                  f"| Val PGD-10: {val_adv*100:.2f}% | ||theta-theta_0||: {dist_from_pre:.3f} "
-                  f"| LR: {opt.param_groups[0]['lr']:.2e} | ||g'||/||g||: {proj_ratio:.4f} "
-                  f"| rank M'={len(basis)} | cos(g, u): [{cos_str}]", flush=True)
+                  f"| Val PGD-10: {val_adv*100:.2f}% | LR: {opt.param_groups[0]['lr']:.2e} "
+                  f"| ||g'||/||g||: {proj_ratio:.4f} | in-span: {frac_span:.4f} "
+                  f"| M'={subspace.rank} | drift: {drift:.3f} | cos: [{cos_str}]{extra}{saved}",
+                  flush=True)
 
-    torch.save(model.state_dict(), save_name)
-    print(f" -> Saved final model to {save_name}", flush=True)
-
-    final_clean = evaluate(model, testloader, device, task_id=task_id, attack_steps=0, desc="Final Clean")
-    final_pgd20 = evaluate(model, testloader, device, task_id=task_id, attack_steps=20, desc="Final PGD-20")
+    final_name = save_name.replace(".pth", "_last.pth")
+    torch.save(model.state_dict(), final_name)
 
     print("\n" + "=" * 70, flush=True)
-    print(" Final Benchmark Verification (Single Deployable Head)", flush=True)
+    print(" Final Benchmark Verification (single head, no task oracle)", flush=True)
     print("=" * 70, flush=True)
-    print(f"Refresh period K      : {refresh_every}", flush=True)
-    print(f"Reference sets M      : {len(ref_loaders)} (rank M' = {len(basis)})", flush=True)
+    if select != "none" and os.path.exists(save_name):
+        print(f" -> Benchmarking the selected checkpoint (epoch {best_epoch}, "
+              f"'{select}' criterion); last epoch kept at {final_name}", flush=True)
+        model.load_state_dict(torch.load(save_name, map_location=device))
+
+    final_clean = evaluate(model, testloader, device, task_id=task_id, attack_steps=0,
+                           desc="Final Clean")
+    final_pgd20 = evaluate(model, testloader, device, task_id=task_id, attack_steps=20,
+                           desc="Final PGD-20")
+
+    print(f"Projection            : {project_mode} / {granularity} / alpha={proj_alpha}"
+          f"{' / renorm' if renorm else ''}", flush=True)
+    print(f"Reference subspace    : {list(objectives)}"
+          f"{' per-class' if per_class else f' x {len(ref_loaders)} pools'}, "
+          f"rank M' = {subspace.rank}, K = {refresh_every}", flush=True)
+    print(f"Refreshes / skipped   : {refreshes} / {skipped_refreshes}", flush=True)
+    print(f"Selected epoch        : {best_epoch} of {epochs} ({select})", flush=True)
     print(f"Pre-align Clean Acc   : {pre_clean*100:.2f}%", flush=True)
-    print(f"Preserved Clean Acc   : {final_clean*100:.2f}% (delta: {100*(final_clean-pre_clean):+.2f}%)", flush=True)
+    print(f"Preserved Clean Acc   : {final_clean*100:.2f}%  "
+          f"(delta {100*(final_clean-pre_clean):+.2f})", flush=True)
     print(f"PGD-20 Robust Acc     : {final_pgd20*100:.2f}%", flush=True)
+    print(" NOTE: both numbers come from the same head, so this row is ONE", flush=True)
+    print("       deployable classifier -- directly comparable to the pgd_at arm.", flush=True)
 
     return {
         "refresh_every": refresh_every,
-        "num_refs": len(ref_loaders),
-        "rank": len(basis),
+        "objectives": list(objectives),
+        "project_mode": project_mode,
+        "granularity": granularity,
+        "alpha": proj_alpha,
+        "rank": subspace.rank,
         "pre_clean": pre_clean,
         "final_clean": final_clean,
         "final_robust": final_pgd20,
+        "best_epoch": best_epoch,
         "epochs_run": epochs,
+        "history": history,
     }
