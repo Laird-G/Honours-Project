@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 import torch
 import torch.nn as nn
@@ -7,7 +8,8 @@ import torch.optim as optim
 from dataset import get_dataloaders
 from models import WideResNet, NormalizedModel
 from methods import METHODS
-from trainer import train_standard, train_gpm_pipeline
+from ogp import make_reference_loaders
+from trainer import train_standard, train_gpm_pipeline, train_ogp_pipeline
 
 torch.backends.cudnn.benchmark = True
 
@@ -24,7 +26,7 @@ def set_seed(seed):
 
 def main():
     parser = argparse.ArgumentParser(description="Adversarial & Continual Learning Framework")
-    parser.add_argument("--mode", type=str, default="clean", choices=["clean", "pgd_at", "gpm"])
+    parser.add_argument("--mode", type=str, default="clean", choices=["clean", "pgd_at", "gpm", "ogp"])
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=None,
@@ -61,6 +63,25 @@ def main():
     parser.add_argument("--gpm_samples", type=int, default=None,
                         help="Cap images used for GPM basis extraction (GPM uses ~1e2; "
                              "more samples flatten the spectrum and inflate k for a given l_th)")
+    # OGP-specific parameters (OGP.pdf Algorithm 1; defaults are the paper's
+    # Appendix A values where it states one)
+    parser.add_argument("--epochs_ogp", type=int, default=30,
+                        help="Adversarial fine-tune epochs for --mode ogp")
+    parser.add_argument("--ogp_lr", type=float, default=0.01, help="OGP fine-tune learning rate")
+    parser.add_argument("--ogp_refresh", type=int, default=30,
+                        help="K: subspace refresh period in steps (paper: 30 for SFT, 5 for DPO)")
+    parser.add_argument("--ogp_num_refs", type=int, default=2,
+                        help="M: number of reference sets (paper: 2)")
+    parser.add_argument("--ogp_ref_samples", type=int, default=200,
+                        help="Images per reference set D_ref^(i) (paper: 200)")
+    parser.add_argument("--ogp_ref_batch", type=int, default=128,
+                        help="Batch B^(i) drawn from each reference set per refresh (paper: 128)")
+    parser.add_argument("--ogp_delta", type=float, default=0.1,
+                        help="Gram-Schmidt collinearity threshold (eq. 11). Relative, because "
+                             "reference gradients are unit-normalised before orthogonalising")
+    parser.add_argument("--ogp_warmup_ratio", type=float, default=0.1,
+                        help="Fraction of total steps spent in linear LR warm-up (paper: 0.1)")
+
     parser.add_argument("--no_oracle_eval", action="store_true",
                         help="Also report the full head x {clean, PGD-20} matrix. The headline "
                              "numbers pair head-0 clean with head-1 robust, which assumes a task "
@@ -71,6 +92,10 @@ def main():
     args = parser.parse_args()
     if args.epochs is None:
         args.epochs = 150 if args.mode == "clean" else 200
+    if args.mode == "ogp" and not (args.clean_checkpoint and os.path.exists(args.clean_checkpoint)):
+        # Algorithm 1 aligns a *pre-trained* model; there is no Stage 1 here.
+        parser.error("--mode ogp requires an existing --clean_checkpoint "
+                     "(e.g. best_clean_cifar10.pth)")
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,6 +166,41 @@ def main():
             plateau_patience=args.plateau_patience,
             adv_alpha=args.gpm_alpha,
             adv_steps=args.gpm_steps,
+        )
+
+    elif args.mode == "ogp":
+        trainloader, valloader, testloader, num_classes = get_dataloaders(
+            dataset=args.dataset, batch_size=args.batch_size, num_workers=args.num_workers, return_val=True
+        )
+
+        base_model = WideResNet(depth=args.depth, num_classes=num_classes, widen_factor=10, num_tasks=2)
+        model = NormalizedModel(base_model, mean=mean, std=std).to(device)
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+        # D_ref^(1..M): disjoint fixed pools of clean, un-augmented images, taken
+        # from the same validation view gpm.get_gpm_bases extracts its basis from.
+        ref_loaders = make_reference_loaders(
+            valloader, num_refs=args.ogp_num_refs, ref_samples=args.ogp_ref_samples,
+            ref_batch=args.ogp_ref_batch, seed=args.seed + 1234,
+        )
+
+        train_ogp_pipeline(
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            testloader=testloader,
+            criterion=criterion,
+            ref_loaders=ref_loaders,
+            clean_checkpoint=args.clean_checkpoint,
+            epochs=args.epochs_ogp,
+            lr=args.ogp_lr,
+            refresh_every=args.ogp_refresh,
+            delta=args.ogp_delta,
+            warmup_ratio=args.ogp_warmup_ratio,
+            adv_alpha=args.train_alpha,
+            adv_steps=args.train_steps,
+            device=device,
+            save_name=f"final_ogp_K{args.ogp_refresh}_M{args.ogp_num_refs}_{args.dataset}.pth",
         )
 
 
