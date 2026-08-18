@@ -532,7 +532,11 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
                     print(f" -> Self-check ({project_mode}): max|U^T U - I| = "
                           f"{chk['gram_err']:.2e}, {chk['detail']} -> "
                           f"{'PASS' if chk['ok'] else 'WARN'}", flush=True)
-                    if max(chk["gram_err"], abs(min(0.0, chk["feas"]))) > 1e-2:
+                    gross = chk["gram_err"]
+                    if chk["enforced"]:
+                        gross = max(gross, abs(min(0.0, chk["feas"])) if
+                                    project_mode == "inequality" else chk["resid"])
+                    if gross > 1e-2:
                         raise RuntimeError(
                             f"OGP self-check failed badly ({chk}): the basis is not "
                             f"orthonormal or the projected gradient violates its constraint. "

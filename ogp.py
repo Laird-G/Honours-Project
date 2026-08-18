@@ -641,11 +641,21 @@ class ReferenceSubspace:
             resid = max(resid, float(c.abs().max()) / denom)
             feas = min(feas, float((grp.R @ c).min()) / denom)
 
-        if self.mode == "equality":
+        # The guarantee only exists at alpha = 1. A partial (or zero) correction
+        # is *meant* to leave the constraint unsatisfied -- that is what the
+        # interpolation knob does -- so asserting feasibility there would fail a
+        # perfectly correct control run. Below alpha = 1 the only invariant left
+        # to check is that the basis itself is orthonormal.
+        enforced = abs(self.alpha - 1.0) < 1e-12
+        if not enforced:
+            ok = gram_err < tol
+            detail = (f"basis only (alpha={self.alpha:g}, constraint not enforced); "
+                      f"resid {resid:.2e}, margin {feas:+.2e}")
+        elif self.mode == "equality":
             ok = gram_err < tol and resid < tol
             detail = f"max|<u_j, g'>|/||g'|| = {resid:.2e}"
         else:
             ok = gram_err < tol and feas > -tol
             detail = f"min <a_i, g'>/||g'|| = {feas:+.2e} (want >= 0)"
         return {"gram_err": gram_err, "resid": resid, "feas": feas,
-                "ok": ok, "detail": detail}
+                "ok": ok, "enforced": enforced, "detail": detail}
