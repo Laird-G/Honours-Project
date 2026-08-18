@@ -123,6 +123,15 @@ def main():
                         help="Temperature tau on the logits for reference losses. tau > 1 keeps "
                              "the clean CE gradient from collapsing on well-fit data; it is also "
                              "the standard distillation temperature for the kl objective")
+    parser.add_argument("--ogp_bn", type=str, default="clean",
+                        choices=["clean", "frozen", "adv"],
+                        help="BatchNorm running statistics, which no gradient projection can "
+                             "reach. clean = re-estimated from clean reference batches each "
+                             "refresh (recommended: stays consistent with the drifting weights "
+                             "AND calibrated to the clean distribution). frozen = pinned at the "
+                             "checkpoint's values (collapses once weights drift freely). "
+                             "adv = standard training updates from adversarial batches (stable, "
+                             "but the clean function drifts through a channel OGP cannot constrain)")
     parser.add_argument("--ogp_select", type=str, default="tradeoff",
                         choices=["tradeoff", "robust", "clean", "none"],
                         help="Checkpoint selection on the held-out selection split. tradeoff = "
@@ -263,6 +272,7 @@ def main():
             proj_alpha=args.ogp_alpha,
             renorm=args.ogp_renorm,
             anchor_weight=args.ogp_anchor_weight,
+            bn_mode=args.ogp_bn,
             select=args.ogp_select,
             selection_loader=selection_loader,
             verbose=True,

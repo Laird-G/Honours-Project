@@ -8,7 +8,8 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from attacks import pgd_attack
 from gpm import get_gpm_bases, project_backbone_gradients
-from ogp import ReferenceSubspace, reference_gradients, flat_dot, flat_norm
+from ogp import (ReferenceSubspace, reference_gradients, refresh_bn_stats,
+                 flat_dot, flat_norm)
 
 MIN_LR = 1e-7
 PROJ_NORM_LOG_EVERY = 50
@@ -334,7 +335,8 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
                        objectives=("ce", "kl"), per_class=False, num_classes=10,
                        ref_temp=2.0, project_mode="equality", granularity="global",
                        proj_alpha=1.0, renorm=False, anchor_weight=0.0,
-                       select="tradeoff", selection_loader=None, verbose=True):
+                       bn_mode="clean", select="tradeoff", selection_loader=None,
+                       verbose=True):
     """OGP as a single-head adversarial fine-tune of a clean checkpoint.
 
     Set --ogp_ref ce --ogp_project equality --ogp_granularity global
@@ -359,11 +361,11 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
     model.base_model.heads[1].requires_grad_(False)
     model.base_model.heads[0].requires_grad_(True)
 
-    # Stats frozen, affine trainable -- see freeze_bn_stats. This closes the one
-    # leak a gradient projection provably cannot: running_mean / running_var are
-    # buffers, so nothing in eq. 12 can stop them tracking the adversarial
-    # distribution.
-    freeze_bn_stats(model)
+    # BN affine is always trainable here (it is covered by the projection, unlike
+    # in GPM). The running statistics are the part no projection can reach; see
+    # ogp.refresh_bn_stats for why all three options exist and what each costs.
+    if bn_mode in ("frozen", "clean"):
+        freeze_bn_stats(model)
 
     # theta_0 for the KL reference objective: a frozen copy of the clean model,
     # which is what "general capability" means concretely here.
@@ -390,8 +392,10 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
         alpha=proj_alpha, renorm=renorm,
     )
 
-    # theta_pre for the optional L2 anchor.
-    theta_pre = [p.detach().clone() for p in params] if anchor_weight > 0 else None
+    # Always kept, not just when the anchor is on: ||theta - theta_0|| is the
+    # diagnostic that distinguishes "learning robustness" from "weights running
+    # away", which is exactly the ambiguity a collapsing run leaves open.
+    theta_pre = [p.detach().clone() for p in params]
 
     pre_clean = evaluate(model, testloader, device, task_id=task_id, attack_steps=0, desc="Pre-align Clean")
     print(f" -> Pre-alignment clean accuracy: {pre_clean*100:.2f}%", flush=True)
@@ -400,7 +404,7 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
     print(f"[STAGE 2/2] OGP-Constrained PGD-{adv_steps} Fine-Tune ({epochs} Epochs)", flush=True)
     print(f"    K = {refresh_every} | project = {project_mode} | granularity = {granularity} "
           f"| alpha = {proj_alpha} | renorm = {renorm} | tau = {ref_temp} "
-          f"| anchor = {anchor_weight} | delta = {delta}", flush=True)
+          f"| anchor = {anchor_weight} | delta = {delta} | bn = {bn_mode}", flush=True)
     print("=" * 70, flush=True)
 
     # Algorithm 1 line 12 is plain gradient descent, and Appendix A sets weight
@@ -431,7 +435,8 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
 
     for epoch in range(epochs):
         model.train()
-        freeze_bn_stats(model)      # model.train() just re-enabled every module
+        if bn_mode in ("frozen", "clean"):
+            freeze_bn_stats(model)  # model.train() just re-enabled every module
 
         train_loss, train_correct, train_total = 0.0, 0, 0
         ratio_sum, span_sum, ratio_n = 0.0, 0.0, 0
@@ -441,6 +446,10 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
         for x, y in pbar:
             # ---- Algorithm 1 lines 3-9: refresh the subspace every K steps ----
             if global_step % refresh_every == 0 and ref_loaders:
+                # Before the reference gradients, so they are measured on a
+                # function whose normalisation matches the current weights.
+                if bn_mode == "clean":
+                    refresh_bn_stats(model, ref_loaders, device, task_id=task_id)
                 grads, labels = reference_gradients(
                     model, ref_loaders, params, device, task_id=task_id,
                     objectives=objectives, temperature=ref_temp, criterion=criterion,
@@ -549,12 +558,9 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
         val_adv = evaluate(model, selection_loader, device, task_id=task_id,
                            attack_steps=10, desc="Val PGD-10")
 
-        if theta_pre is not None:
-            with torch.no_grad():
-                drift = math.sqrt(sum(float((p - p0).norm()) ** 2
-                                      for p, p0 in zip(params, theta_pre)))
-        else:
-            drift = float('nan')
+        with torch.no_grad():
+            drift = math.sqrt(sum(float((p - p0).norm()) ** 2
+                                  for p, p0 in zip(params, theta_pre)))
 
         # Selecting on robustness alone would pick the most-forgetting epoch,
         # which is the opposite of what this arm is for.

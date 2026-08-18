@@ -183,6 +183,49 @@ def split_reference_and_selection(valloader, num_refs, ref_samples, ref_batch,
 # Reference gradients (Algorithm 1 lines 4-7)
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
+def refresh_bn_stats(model, ref_loaders, device, task_id=0, n_batches=4):
+    """Re-estimate BatchNorm running statistics from CLEAN reference data.
+
+    The third option between the two bad ones, and the fix for the collapse a
+    frozen-BN adversarial fine-tune produces:
+
+      * BN in train mode ("adv") lets running_mean/var track the ADVERSARIAL
+        input distribution. They are buffers, not parameters, so no gradient
+        projection can reach them -- the clean function drifts through a channel
+        the method structurally cannot constrain.
+      * BN pinned at theta_0's values ("frozen") stops that, but nothing then
+        renormalises activations as the conv weights drift. A small per-layer
+        scale error compounds multiplicatively over 28 layers until activations
+        saturate and the model collapses to a constant predictor. GPM gets away
+        with freezing because its projection is strong enough that the weights
+        barely move; a weak or inactive constraint does not.
+
+    Re-estimating from clean batches keeps the statistics consistent with the
+    CURRENT weights (so no compounding drift) while calibrating them to the
+    CLEAN distribution (so the protected function is the one being measured).
+    Costs a handful of forward passes at the refresh cadence, no backward.
+    """
+    bns = [m for m in model.modules() if isinstance(m, torch.nn.BatchNorm2d)]
+    if not bns or not ref_loaders:
+        return 0
+    prev = [(m, m.training) for m in bns]
+    for m, _ in prev:
+        m.train()
+    seen = 0
+    try:
+        for loader in ref_loaders:
+            x, _ = loader.next_batch()
+            model(x.to(device, non_blocking=True), task_id=task_id)
+            seen += 1
+            if seen >= n_batches:
+                break
+    finally:
+        for m, mode in prev:
+            m.training = mode
+    return seen
+
+
 def _snapshot(params):
     return [p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
             for p in params]
@@ -288,15 +331,27 @@ def reference_gradients(model, ref_loaders, params, device, task_id=0,
 def _nnqp(W, b, step, iters):
     """min over v >= 0 of  0.5 v^T W v + v^T b   (the GEM dual).
 
-    Projected gradient descent. W is M x M with M <= ~20, so this is
-    microseconds on CPU and needs no external solver. W is PSD and the feasible
-    set is a box, so the iteration is monotone; the caller feasibility-checks the
-    result and falls back to the always-feasible orthogonal projection if the
-    iteration has not converged far enough.
+    FISTA (accelerated projected gradient), not plain projected gradient. The
+    distinction is not cosmetic: plain PG converges at a rate set by the
+    condition number of W, and W here is built from near-parallel reference
+    gradients, so it is badly conditioned. Under-convergence is indistinguishable
+    from "no constraint is violated" -- both leave v at its zero initialisation --
+    so a slow solver silently turns the inequality mode into a no-op or, once the
+    caller's feasibility check fires, into an erratic mix of no-op and full
+    orthogonal projection. FISTA's sqrt(kappa) rate removes that failure mode at
+    identical cost; W is at most ~20x20 so the whole solve is microseconds.
+
+    The caller still feasibility-checks and falls back to the always-feasible
+    orthogonal projection, but that path should now be rare -- a high fallback
+    count means the conditioning assumption has broken down and is worth logging.
     """
     v = torch.zeros_like(b)
+    z, t = v.clone(), 1.0
     for _ in range(iters):
-        v = torch.clamp(v - step * (W @ v + b), min=0.0)
+        v_next = torch.clamp(z - step * (W @ z + b), min=0.0)
+        t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+        z = v_next + ((t - 1.0) / t_next) * (v_next - v)
+        v, t = v_next, t_next
     return v
 
 
@@ -310,11 +365,19 @@ def _gram_schmidt_group(vectors, delta):
     since the projector is invariant to positive rescaling of the basis,
     pre-normalising changes nothing but makes delta portable.
 
-    Returns (basis, R, residuals) with  a_i = sum_j R[i,j] u_j  where
-    a_i = vectors[i] / ||vectors[i]||, exact up to a discarded residual < delta.
+    Returns (basis, R, residuals). R is restricted to the RETAINED directions,
+    so it is (M' x M') lower-triangular with diagonal entries >= delta, hence
+    invertible and W = R R^T is strictly positive definite.
+
+    That restriction is what makes the GEM dual solvable. Keeping a row for every
+    input direction -- including those Gram-Schmidt discarded as near-collinear --
+    makes W rank-deficient (M rows, rank M'), the dual loses strong convexity,
+    and the solver stalls at v = 0, which is indistinguishable from "nothing to
+    correct". A discarded direction is >= (1 - delta) explained by the retained
+    ones, so dropping its constraint is a mild, bounded relaxation.
     """
-    basis, rows, residuals = [], [], []
-    for g in vectors:
+    basis, rows, residuals, kept = [], [], [], []
+    for i, g in enumerate(vectors):
         n0 = flat_norm(g)
         if n0 <= 1e-12:
             rows.append([])
@@ -336,10 +399,11 @@ def _gram_schmidt_group(vectors, delta):
                 vt.div_(nv)
             basis.append(v)
             coeffs.append(nv)
-        rows.append(coeffs)
+            rows.append(coeffs)
+            kept.append(i)
 
     mp = len(basis)
-    R = torch.zeros(len(vectors), mp, dtype=torch.float64)
+    R = torch.zeros(mp, mp, dtype=torch.float64)
     for i, row in enumerate(rows):
         for j, c in enumerate(row[:mp]):
             R[i, j] = c
