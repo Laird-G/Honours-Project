@@ -514,7 +514,7 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
             if subspace.rank:
                 want_stats = (global_step % PROJ_NORM_LOG_EVERY == 0) or not checked
                 stats = subspace.project(params, return_stats=want_stats)
-                if stats is not None and stats["before"] > 0:
+                if stats is not None and math.isfinite(stats["before"]) and stats["before"] > 0:
                     ratio_sum += stats["ratio"]
                     span_sum += stats["frac_in_span"]
                     ratio_n += 1
@@ -522,9 +522,13 @@ def train_ogp_pipeline(model, trainloader, valloader, testloader, criterion, ref
                     fallbacks += stats["n_fallback"]
                     last_cosines = stats["cosines"]
 
-                if not checked:
-                    chk = subspace.selfcheck(
-                        params, scale=stats["before"] if stats else None)
+                # Deliberately not on step 0: GradScaler starts at scale 65536,
+                # so the first step's gradients routinely overflow and the
+                # optimizer step is discarded. Checking there validates nothing
+                # and reports a vacuous PASS (+inf margins) on inf/nan input.
+                if not checked and stats and math.isfinite(stats["before"]) \
+                        and stats["before"] > 0:
+                    chk = subspace.selfcheck(params, scale=stats["before"])
                     print(f" -> Self-check ({project_mode}): max|U^T U - I| = "
                           f"{chk['gram_err']:.2e}, {chk['detail']} -> "
                           f"{'PASS' if chk['ok'] else 'WARN'}", flush=True)
